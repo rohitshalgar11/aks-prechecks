@@ -1,0 +1,161 @@
+name: AKS upgrade pre-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Which clusters to check
+        type: choice
+        options: [dev, uat, prod, all]
+        default: dev
+      target_version:
+        description: Target Kubernetes version, e.g. 1.31.2 (empty = latest GA patch of the next minor)
+        type: string
+        required: false
+      fail_on_blockers:
+        description: Fail the run if any blocker is found (use as an upgrade gate)
+        type: boolean
+        default: true
+  # Lets a future upgrade workflow call this as its gate:
+  #   uses: ./.github/workflows/aks-upgrade-precheck.yml
+  workflow_call:
+    inputs:
+      environment: { type: string, required: true }
+      target_version: { type: string, required: false, default: "" }
+      fail_on_blockers: { type: boolean, required: false, default: true }
+  schedule:
+    # ~20th of every month, 08:47 IST (03:17 UTC): advance-warning scan of ALL clusters
+    - cron: "17 3 20 * *"
+
+permissions:
+  id-token: write   # OIDC login to Azure
+  contents: read
+
+concurrency:
+  group: aks-precheck-${{ github.event_name == 'schedule' && 'all' || inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Select clusters
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env:
+          ENV_FILTER: ${{ github.event_name == 'schedule' && 'all' || inputs.environment }}
+        run: |
+          matrix=$(jq -c --arg e "$ENV_FILTER" \
+            '[.clusters[] | select($e == "all" or .env == $e)]' config/clusters.json)
+          if [ "$matrix" = "[]" ]; then
+            echo "::error::No clusters in config/clusters.json for environment '$ENV_FILTER'"; exit 1
+          fi
+          echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
+          echo "Checking: $(jq -r '[.[].name] | join(", ")' <<< "$matrix")"
+
+  precheck:
+    name: precheck (${{ matrix.name }})
+    needs: plan
+    # Private clusters: self-hosted runner inside (or peered to) the cluster VNet
+    runs-on: [self-hosted, linux, aks-precheck]
+    # One GitHub environment per env, holding AZURE_CLIENT_ID / AZURE_TENANT_ID and the
+    # matching OIDC federated credential (subject repo:<org>/<repo>:environment:precheck-<env>).
+    # Keep these WITHOUT required reviewers: they only read.
+    environment: precheck-${{ matrix.env }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      OUT_DIR: ${{ github.workspace }}/out/${{ matrix.name }}
+      RAW: ${{ github.workspace }}/out/${{ matrix.name }}/raw
+      RG: ${{ matrix.resourceGroup }}
+      CLUSTER: ${{ matrix.name }}
+      TARGET_INPUT: ${{ inputs.target_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ matrix.subscriptionId }}
+
+      - name: Ensure tools (kubectl, kubelogin, kubent, python deps)
+        run: bash scripts/install-tools.sh
+
+      - name: Get cluster credentials
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig-$CLUSTER"
+          az aks get-credentials -g "$RG" -n "$CLUSTER" --file "$KUBECONFIG" --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli --kubeconfig "$KUBECONFIG"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          kubectl version -o yaml | grep -E 'gitVersion' || true
+
+      - name: Collect AKS metadata
+        run: |
+          mkdir -p "$RAW"
+          az aks show          -g "$RG" -n "$CLUSTER"            -o json > "$RAW/cluster.json"
+          az aks get-upgrades  -g "$RG" -n "$CLUSTER"            -o json > "$RAW/upgrades.json"
+          az aks nodepool list -g "$RG" --cluster-name "$CLUSTER" -o json > "$RAW/nodepools.json"
+
+      - name: Resolve target version
+        id: target
+        run: |
+          t=$(python scripts/precheck.py resolve-target \
+                --cluster-json "$RAW/cluster.json" --upgrades-json "$RAW/upgrades.json" \
+                --target "$TARGET_INPUT")
+          echo "Target version for $CLUSTER: $t"
+          echo "version=$t" >> "$GITHUB_OUTPUT"
+
+      - name: Scan removed APIs (kubent)
+        run: |
+          kubent --target-version "${{ steps.target.outputs.version }}" \
+                 --output json --log-level warn > "$RAW/kubent.json"
+
+      - name: Read runtime deprecated-API metric
+        run: |
+          kubectl get --raw /metrics 2> "$RAW/metrics.err" \
+            | grep '^apiserver_requested_deprecated_apis' > "$RAW/deprecated-api-metrics.txt" || true
+
+      - name: Run pre-check
+        id: scan
+        run: |
+          python scripts/precheck.py scan \
+            --cluster-name "$CLUSTER" --env "${{ matrix.env }}" \
+            --target "${{ steps.target.outputs.version }}" \
+            --cluster-json "$RAW/cluster.json" --upgrades-json "$RAW/upgrades.json" \
+            --nodepools-json "$RAW/nodepools.json" --kubent-json "$RAW/kubent.json" \
+            --metrics-file "$RAW/deprecated-api-metrics.txt" --metrics-err "$RAW/metrics.err" \
+            --config config/precheck.json --out-dir "$OUT_DIR"
+          cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: precheck-${{ matrix.name }}
+          path: out/${{ matrix.name }}
+          retention-days: 90
+
+      - name: Gate on blockers
+        if: steps.scan.outputs.blockers != '0' && github.event_name != 'schedule' && inputs.fail_on_blockers
+        run: |
+          echo "::error::${{ steps.scan.outputs.blockers }} blocker(s) on $CLUSTER. Fix them before upgrading (see the report artifact)."
+          exit 1
+
+  summary:
+    name: Summary
+    needs: precheck
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: precheck-*
+          path: reports
+      - name: Combined summary
+        run: python3 scripts/precheck.py summary --reports-dir reports >> "$GITHUB_STEP_SUMMARY"

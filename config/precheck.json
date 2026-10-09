@@ -1,0 +1,7 @@
+{
+  "ownerLabels": ["team", "owner"],
+  "platformNamespaces": ["kube-system", "kube-public", "kube-node-lease", "gatekeeper-system", "devops"],
+  "ignoreNamespaces": [],
+  "restartThreshold": 5,
+  "pendingMinutes": 10
+}

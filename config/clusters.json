@@ -1,0 +1,7 @@
+{
+  "clusters": [
+    { "name": "aks-dev-01",  "env": "dev",  "resourceGroup": "rg-aks-dev",  "subscriptionId": "00000000-0000-0000-0000-000000000001" },
+    { "name": "aks-uat-01",  "env": "uat",  "resourceGroup": "rg-aks-uat",  "subscriptionId": "00000000-0000-0000-0000-000000000002" },
+    { "name": "aks-prod-01", "env": "prod", "resourceGroup": "rg-aks-prod", "subscriptionId": "00000000-0000-0000-0000-000000000003" }
+  ]
+}
